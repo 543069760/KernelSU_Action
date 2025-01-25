@@ -1,98 +1,81 @@
-name: Build kernel
+name: Build Kernel
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  build-kernel:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      - name: Checkout kernel source
+        uses: actions/checkout@v3
+        with:
+          repository: OnePlusOSS/android_kernel_oneplus_sm8650
+          ref: oneplus/sm8650_v_15.0.0_oneplus_ace5
+          path: kernel_workspace/android-kernel
 
-    - name: Set up dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc bison build-essential curl flex gcc-multilib git gnupg gperf imagemagick libncurses-dev libssl-dev libtool libxml2-utils make patch unzip xsltproc zip zlib1g-dev ccache
+      - name: Checkout vendor modules
+        uses: actions/checkout@v3
+        with:
+          repository: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650
+          path: kernel_workspace/vendor-modules
 
-    - name: Clone kernel source
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone --depth=1 ${KERNEL_SOURCE} -b ${KERNEL_SOURCE_BRANCH} android-kernel
+      - name: Copy vendor/oplus/kernel/cpu to kernel source
+        run: |
+          mkdir -p kernel_workspace/android-kernel/vendor/oplus/kernel
+          cp -r kernel_workspace/vendor-modules/vendor/oplus/kernel/cpu kernel_workspace/android-kernel/vendor/oplus/kernel/
 
-    - name: Clone modules and devicetree repository
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650.git modules_and_devicetree
+      - name: Fix symlink for kernel/oplus_cpu
+        run: |
+          cd kernel_workspace/android-kernel/kernel
+          rm -rf oplus_cpu
+          ln -s ../../../vendor/oplus/kernel/cpu oplus_cpu
 
-    - name: Link vendor directory
-      run: |
-        ln -s $GITHUB_WORKSPACE/kernel_workspace/modules_and_devicetree/vendor $GITHUB_WORKSPACE/kernel_workspace/android-kernel/vendor
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev bc ccache
 
-    - name: Clone Clang compiler
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        if [ "$USE_CUSTOM_CLANG" = true ]; then
-          git clone --depth=1 ${CUSTOM_CLANG_SOURCE} -b ${CUSTOM_CLANG_BRANCH} clang-aosp
-        else
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-${CLANG_VERSION} -b ${CLANG_BRANCH} clang-aosp
-        fi
+      - name: Set up Clang
+        run: |
+          mkdir -p kernel_workspace/clang-aosp
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz -C kernel_workspace/clang-aosp
+          rm clang.tar.gz
 
-    - name: Setup GCC toolchains
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        if [ "$ENABLE_GCC_ARM64" = true ] && [ "$USE_CUSTOM_GCC_64" = false ]; then
-          wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1_r1.tar.gz
-          tar -xzf android-12.1_r1.tar.gz -C .
-          mv aarch64-linux-android-4.9 gcc-64
-        elif [ "$ENABLE_GCC_ARM64" = true ] && [ "$USE_CUSTOM_GCC_64" = true ]; then
-          git clone --depth=1 ${CUSTOM_GCC_64_SOURCE} -b ${CUSTOM_GCC_64_BRANCH} gcc-64
-        fi
+      - name: Set up GCC
+        run: |
+          mkdir -p kernel_workspace/gcc-64 kernel_workspace/gcc-32
+          wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz -O gcc-64.tar.gz
+          wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/heads/master.tar.gz -O gcc-32.tar.gz
+          tar -xzf gcc-64.tar.gz -C kernel_workspace/gcc-64
+          tar -xzf gcc-32.tar.gz -C kernel_workspace/gcc-32
+          rm gcc-64.tar.gz gcc-32.tar.gz
 
-        if [ "$ENABLE_GCC_ARM32" = true ] && [ "$USE_CUSTOM_GCC_32" = false ]; then
-          wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1_r1.tar.gz
-          tar -xzf android-12.1_r1.tar.gz -C .
-          mv arm-linux-androideabi-4.9 gcc-32
-        elif [ "$ENABLE_GCC_ARM32" = true ] && [ "$USE_CUSTOM_GCC_32" = true ]; then
-          git clone --depth=1 ${CUSTOM_GCC_32_SOURCE} -b ${CUSTOM_GCC_32_BRANCH} gcc-32
-        fi
+      - name: Build kernel
+        run: |
+          cd kernel_workspace/android-kernel
+          export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$PATH
+          export KBUILD_BUILD_HOST=Github-Action
+          export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+          make -j$(nproc --all) CC=clang O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin/aarch64-linux-android- CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin/arm-linux-androideabi- gki_defconfig
+          if [ "${{ env.ENABLE_CCACHE }}" = "true" ]; then
+              make -j$(nproc --all) CC="ccache clang" O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin/aarch64-linux-android- CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin/arm-linux-androideabi-
+          else
+              make -j$(nproc --all) CC=clang O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin/aarch64-linux-android- CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin/arm-linux-androideabi-
+          fi
 
-    - name: Print environment variables
-      run: |
-        echo "KBUILD_BUILD_USER: $(echo ${{ github.actor }} | tr A-Z a-z)"
-        echo "KSU_EXPECTED_SIZE: ${{ env.KSU_EXPECTED_SIZE }}"
-        echo "KSU_EXPECTED_HASH: ${{ env.KSU_EXPECTED_HASH }}"
-        echo "ARCH: ${{ env.ARCH }}"
-        echo "GCC_64: ${{ env.GCC_64 }}"
-        echo "GCC_32: ${{ env.GCC_32 }}"
-        echo "KERNEL_CONFIG: ${{ env.KERNEL_CONFIG }}"
-
-    - name: Build kernel
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$PATH
-        export KBUILD_BUILD_HOST=Github-Action
-        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
-        if [ ! -z "${{ env.KSU_EXPECTED_SIZE }}" ] && [ ! -z "${{ env.KSU_EXPECTED_HASH }}" ]; then
-          export KSU_EXPECTED_SIZE=${{ env.KSU_EXPECTED_SIZE }}
-          export KSU_EXPECTED_HASH=${{ env.KSU_EXPECTED_HASH }}
-        fi
-        make -j$(nproc --all) CC=clang O=out ARCH=${{ env.ARCH }} ${{ env.CUSTOM_CMDS }} ${{ env.EXTRA_CMDS }} ${{ env.GCC_64 }} ${{ env.GCC_32 }} ${{ env.KERNEL_CONFIG }}
-        if [ "${{ env.ENABLE_CCACHE }}" = true ]; then
-            make -j$(nproc --all) CC="ccache clang" O=out ARCH=${{ env.ARCH }} ${{ env.CUSTOM_CMDS }} ${{ env.EXTRA_CMDS }} ${{ env.GCC_64 }} ${{ env.GCC_32 }}
-        else
-            make -j$(nproc --all) CC=clang O=out ARCH=${{ env.ARCH }} ${{ env.CUSTOM_CMDS }} ${{ env.EXTRA_CMDS }} ${{ env.GCC_64 }} ${{ env.GCC_32 }}
-        fi
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v2
-      with:
-        name: kernel-image
-        path: $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/${{ env.ARCH }}/boot/$KERNEL_IMAGE_NAME
+    env:
+      ENABLE_CCACHE: true
+      ARCH: arm64
+      KERNEL_CONFIG: gki_defconfig
+      GCC_64: CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin/aarch64-linux-android-
+      GCC_32: CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin/arm-linux-androideabi-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+      LD: ld.lld
